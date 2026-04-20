@@ -1,0 +1,83 @@
+# =============================================================
+# Docker Compose — 3-Router DV Routing Test Topology
+# =============================================================
+#
+# Topology:
+#   Router_A <──net_ab──> Router_B <──net_bc──> Router_C
+#
+# Two Docker bridge networks simulate point-to-point links:
+#   net_ab : connects A and B  (10.10.1.0/24)
+#   net_bc : connects B and C  (10.10.2.0/24)
+#
+# Router B is on BOTH networks (it is the transit router).
+# Router A can only reach C through B, and vice versa.
+#
+# Usage:
+#   docker-compose up --build          ← start all routers
+#   docker-compose logs -f             ← watch convergence
+#   docker-compose stop router_c       ← simulate failure
+#   docker-compose start router_c      ← bring it back
+#   docker-compose down                ← tear everything down
+# =============================================================
+
+services:
+
+  # ─── Router A ───────────────────────────────────────────
+  # Connected only to net_ab.
+  # Neighbor: router_b (resolved via Docker DNS)
+  router_a:
+    build: .
+    container_name: router_a
+    hostname: router_a
+    cap_add:
+      - NET_ADMIN            # Required for `ip route replace`
+    environment:
+      - NEIGHBORS=router_b   # Docker DNS name of neighbor
+    networks:
+      net_ab:
+        ipv4_address: 10.10.1.10
+
+  # ─── Router B (transit) ────────────────────────────────
+  # Connected to BOTH net_ab and net_bc.
+  # Neighbors: router_a and router_c
+  router_b:
+    build: .
+    container_name: router_b
+    hostname: router_b
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - NEIGHBORS=router_a,router_c
+    networks:
+      net_ab:
+        ipv4_address: 10.10.1.20
+      net_bc:
+        ipv4_address: 10.10.2.20
+
+  # ─── Router C ───────────────────────────────────────────
+  # Connected only to net_bc.
+  # Neighbor: router_b
+  router_c:
+    build: .
+    container_name: router_c
+    hostname: router_c
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - NEIGHBORS=router_b
+    networks:
+      net_bc:
+        ipv4_address: 10.10.2.30
+
+# ─── Networks (simulated links) ─────────────────────────
+networks:
+  net_ab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+  net_bc:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
