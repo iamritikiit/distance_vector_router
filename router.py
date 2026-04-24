@@ -12,14 +12,16 @@ import ipaddress
 # ---------------------------------------------------------------------------
 
 UDP_PORT           = 5000                 # Protocol port (all routers)
-BROADCAST_INTERVAL = 3                    # Seconds between periodic updates
+BROADCAST_INTERVAL = 2                    # Seconds between periodic updates
 MAX_DISTANCE       = 16                   # Infinity metric (RIP convention)
-NEIGHBOR_TIMEOUT   = 15                   # Seconds before declaring a neighbor dead
+NEIGHBOR_TIMEOUT   = 12                   # Seconds before declaring a neighbor dead
 BUFFER_SIZE        = 65535                # Max UDP datagram we'll accept
-DV_VERSION         = 1.0                  # Protocol version tag
+DV_VERSION         = 1                    # Protocol version tag (integer)
 CONVERGE_CYCLES    = 3                    # Stable cycles before declaring convergence
-POISON_HOLD_CYCLES = 2                    # How many broadcast cycles a poisoned route
+POISON_HOLD_CYCLES = 3                    # How many broadcast cycles a poisoned route
                                           # is kept (at distance 16) before removal
+LINK_DOWN_THRESHOLD = 2                   # Consecutive interface-check misses before
+                                          # declaring a connected link as down
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -51,6 +53,13 @@ neighbor_last_seen: dict[str, float] = {}
 # POISON_HOLD_CYCLES broadcasts so that every neighbor learns about
 # the withdrawal.  After the counter reaches 0 the route is removed.
 poison_hold: dict[str, int] = {}
+
+# Link-down debounce counters.  Before declaring a directly-connected
+# subnet as "down", we require LINK_DOWN_THRESHOLD consecutive
+# interface-check misses.  This prevents transient kernel/Docker
+# glitches from falsely poisoning connected routes.
+# link_miss_count : { "subnet" : int(consecutive_misses) }
+link_miss_count: dict[str, int] = {}
 
 # Convergence tracking: counts consecutive broadcast cycles during
 # which no routing table change was observed.
@@ -146,66 +155,120 @@ if not NEIGHBORS:
 # Helper: discover directly-connected subnets via `ip addr`
 # ---------------------------------------------------------------------------
 
-def discover_connected_subnets() -> list[str]:
+def discover_connected_subnets() -> dict[str, str]:
     """
     Parse the output of `ip -o addr show` to find every IPv4 subnet
     that this router is directly attached to.
 
-    Returns a list of CIDR strings, e.g. ["10.0.1.0/24", "10.0.2.0/24"].
+    Returns a dict mapping CIDR networks to their interface name:
+      {"10.0.1.0/24": "eth0"}
+
+    Retries once on empty result to guard against transient kernel
+    races (e.g. during Docker network attach/detach).
     """
-    subnets: list[str] = []
+    for attempt in range(2):
+        subnets: dict[str, str] = {}
+        try:
+            output = subprocess.check_output(
+                ["ip", "-o", "-4", "addr", "show"],
+                text=True,
+            )
+            for line in output.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    dev_name = parts[1]
+                    for i, token in enumerate(parts):
+                        if token == "inet" and i + 1 < len(parts):
+                            cidr = parts[i + 1]            # e.g. "10.0.1.2/24"
+                            iface = ipaddress.IPv4Interface(cidr)
+                            network = str(iface.network)    # e.g. "10.0.1.0/24"
+                            # Skip loopback
+                            if network.startswith("127."):
+                                continue
+                            subnets[network] = dev_name
+        except Exception as exc:
+            logger.error("Failed to discover connected subnets: %s", exc)
+
+        if subnets or attempt == 1:
+            return subnets
+
+        # Empty result on first attempt — retry after a brief pause
+        time.sleep(0.2)
+
+    return subnets
+
+
+def is_on_my_subnet(ip_str: str) -> bool:
+    """
+    Check whether `ip_str` falls within any of our currently-connected
+    subnets.  Used to validate that a packet sender is actually a
+    directly-attached neighbor — not a stale route via Docker gateway
+    cross-network routing.
+
+    Returns True if the IP is on one of our connected subnets.
+    """
     try:
-        output = subprocess.check_output(
-            ["ip", "-o", "-4", "addr", "show"],
-            text=True,
-        )
-        for line in output.strip().splitlines():
-            # Typical line:
-            #   2: eth0  inet 10.0.1.2/24 brd 10.0.1.255 scope global eth0
-            parts = line.split()
-            for i, token in enumerate(parts):
-                if token == "inet" and i + 1 < len(parts):
-                    cidr = parts[i + 1]            # e.g. "10.0.1.2/24"
-                    iface = ipaddress.IPv4Interface(cidr)
-                    network = str(iface.network)    # e.g. "10.0.1.0/24"
-                    # Skip loopback
-                    if network.startswith("127."):
-                        continue
-                    subnets.append(network)
-    except Exception as exc:
-        logger.error("Failed to discover connected subnets: %s", exc)
-    # Deduplicate: a host with multiple IPs on the same subnet should
-    # only advertise that subnet once.
-    return list(dict.fromkeys(subnets))
+        addr = ipaddress.IPv4Address(ip_str)
+        connected = discover_connected_subnets()
+        for subnet_cidr in connected:
+            network = ipaddress.IPv4Network(subnet_cidr, strict=False)
+            if addr in network:
+                return True
+    except (ValueError, Exception):
+        pass
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Helper: apply a route to the Linux kernel FIB
 # ---------------------------------------------------------------------------
 
-def apply_route(subnet: str, next_hop: str) -> None:
+def apply_route(subnet: str, next_hop: str) -> bool:
     """
     Install or replace a route in the Linux routing table using
     `ip route replace <subnet> via <next_hop>`.
 
     For directly-connected subnets (next_hop == "0.0.0.0") we skip
     because the kernel already has them.
+
+    Returns True if the route was successfully installed (or skipped
+    for connected subnets), False if the kernel rejected it.
     """
     if next_hop == "0.0.0.0":
-        return  # Kernel manages connected routes itself
+        return True  # Kernel manages connected routes itself
     try:
         cmd = ["ip", "route", "replace", subnet, "via", next_hop]
         subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         logger.info("KERNEL  ip route replace %s via %s", subnet, next_hop)
+        return True
     except subprocess.CalledProcessError as exc:
-        logger.error("ip route replace failed: %s", exc)
+        logger.error("ip route replace %s via %s FAILED: %s", subnet, next_hop, exc)
+        return False
 
 
 def remove_route(subnet: str) -> None:
     """
     Delete a route from the Linux FIB.
     Silently ignores errors (e.g. route already absent).
+
+    SAFETY: Never removes a route for a currently-connected subnet.
+    Deleting a kernel-managed connected route would break reachability
+    on that interface, and the kernel does NOT automatically re-add it.
     """
+    # --- Connected-route protection ---
+    # Check if this subnet corresponds to an active interface.
+    # If so, refuse to delete — the kernel needs this route.
+    try:
+        connected = discover_connected_subnets()
+        if subnet in connected:
+            logger.info(
+                "KERNEL  SKIP ip route del %s — subnet is currently connected",
+                subnet,
+            )
+            return
+    except Exception:
+        pass  # If discovery fails, proceed cautiously (still try to delete)
+
     try:
         cmd = ["ip", "route", "del", subnet]
         subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -223,7 +286,7 @@ def initialize_routing_table() -> None:
     Populate the routing table with all directly-connected subnets
     at distance 0 and next_hop 0.0.0.0 (meaning 'self / connected').
     """
-    connected = discover_connected_subnets()
+    connected = discover_connected_subnets().keys()
     with table_lock:
         for subnet in connected:
             routing_table[subnet] = [0, "0.0.0.0"]
@@ -385,6 +448,10 @@ def broadcast_updates() -> None:
                 logger.error("SEND    failed to %s: %s", neighbor, exc)
 
         # ---- Garbage-collect poisoned routes that have been held long enough ----
+        # First, snapshot currently-connected subnets OUTSIDE the lock
+        # to avoid holding the lock during a subprocess call.
+        current_connected = discover_connected_subnets()
+
         with table_lock:
             expired = []
             for subnet in list(poison_hold.keys()):
@@ -396,12 +463,34 @@ def broadcast_updates() -> None:
                 if subnet in routing_table:
                     dist, _ = routing_table[subnet]
                     if dist >= MAX_DISTANCE:
-                        logger.info(
-                            "FLUSH   %s removed after %d poison-hold cycles",
-                            subnet, POISON_HOLD_CYCLES,
-                        )
-                        remove_route(subnet)
-                        del routing_table[subnet]
+                        # --- CONNECTED-ROUTE PROTECTION ---
+                        # If this subnet is currently connected (interface
+                        # still present), it was falsely poisoned.  Restore
+                        # it to distance 0 instead of flushing.
+                        if subnet in current_connected:
+                            logger.info(
+                                "GC-RESTORE  %s is still connected — restoring to distance 0 "
+                                "(was falsely poisoned)",
+                                subnet,
+                            )
+                            routing_table[subnet] = [0, "0.0.0.0"]
+                            # Restore the kernel route too
+                            dev = current_connected[subnet]
+                            try:
+                                subprocess.call(
+                                    ["ip", "route", "replace", subnet, "dev", dev],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            logger.info(
+                                "FLUSH   %s removed after %d poison-hold cycles",
+                                subnet, POISON_HOLD_CYCLES,
+                            )
+                            remove_route(subnet)
+                            del routing_table[subnet]
 
         # ---- Periodic routing table log (for convergence demo) ----
         print_routing_table("Periodic broadcast snapshot")
@@ -500,7 +589,9 @@ def update_logic(neighbor_ip: str, routes_from_neighbor: list[dict]) -> None:
             else:
                 cur_dist, cur_nh = current
 
-                # Skip directly-connected subnets — they are immutable
+                # Skip directly-connected subnets — they are immutable.
+                # A connected route (distance 0, next_hop 0.0.0.0) must
+                # NEVER be overridden by a learned route from any neighbor.
                 if cur_dist == 0 and cur_nh == "0.0.0.0":
                     continue
 
@@ -544,6 +635,20 @@ def update_logic(neighbor_ip: str, routes_from_neighbor: list[dict]) -> None:
                     # found a viable alternative path.
                     poison_hold.pop(subnet, None)
 
+                elif cur_dist >= MAX_DISTANCE and new_distance < MAX_DISTANCE:
+                    # ----- Route was poisoned but a DIFFERENT neighbor now
+                    #        offers a viable alternative.  Accept it even if
+                    #        it's not "shorter" than the poisoned distance,
+                    #        because any finite distance is better than ∞. -----
+                    routing_table[subnet] = [new_distance, neighbor_ip]
+                    logger.info(
+                        "RECOVER %s via %s distance %d (was poisoned at %d)",
+                        subnet, neighbor_ip, new_distance, cur_dist,
+                    )
+                    changed = True
+                    apply_route(subnet, neighbor_ip)
+                    poison_hold.pop(subnet, None)
+
         # ---- Reset convergence counter if anything changed ----
         if changed:
             stable_cycles = 0
@@ -580,8 +685,11 @@ def neighbor_timeout_checker() -> None:
       Phase 2 — FLUSH:   After POISON_HOLD_CYCLES broadcasts the route
                 is garbage-collected by the broadcast_updates loop.
 
-    This prevents sudden route disappearance that could leave neighbors
-    in an inconsistent state.
+    Also monitors physical link status with debounce — a connected
+    subnet must be missing from `ip addr` for LINK_DOWN_THRESHOLD
+    consecutive checks before it is declared down.  This prevents
+    transient kernel/Docker races from falsely poisoning connected
+    routes.
 
     Runs forever in a daemon thread.
     """
@@ -594,6 +702,72 @@ def neighbor_timeout_checker() -> None:
         now = time.time()
         dead_neighbors: list[str] = []
 
+        # ---- 1. Check for physical link changes (with debounce) ----
+        current_interfaces = discover_connected_subnets()
+        changed_links = False
+
+        with table_lock:
+            # Check for dead links (subnets that were directly connected
+            # but are no longer present in the interface list).
+            # Uses debounce: only declare down after LINK_DOWN_THRESHOLD
+            # consecutive misses.
+            for subnet, (dist, nh) in list(routing_table.items()):
+                if nh == "0.0.0.0" and dist < MAX_DISTANCE:
+                    if subnet not in current_interfaces:
+                        # Increment miss counter
+                        link_miss_count[subnet] = link_miss_count.get(subnet, 0) + 1
+                        misses = link_miss_count[subnet]
+
+                        if misses >= LINK_DOWN_THRESHOLD:
+                            # Confirmed down after multiple consecutive misses
+                            logger.warning(
+                                "LINK DOWN %s — confirmed after %d consecutive misses, poisoning route",
+                                subnet, misses,
+                            )
+                            routing_table[subnet] = [MAX_DISTANCE, "0.0.0.0"]
+                            poison_hold[subnet] = POISON_HOLD_CYCLES
+                            remove_route(subnet)
+                            changed_links = True
+                            link_miss_count.pop(subnet, None)
+                        else:
+                            logger.info(
+                                "LINK MAYBE %s — miss %d/%d (debouncing, not yet confirmed)",
+                                subnet, misses, LINK_DOWN_THRESHOLD,
+                            )
+                    else:
+                        # Interface is present — reset miss counter
+                        link_miss_count.pop(subnet, None)
+
+            # Check for recovered or new links
+            for subnet, dev_name in current_interfaces.items():
+                entry = routing_table.get(subnet)
+                # If it's missing, or currently poisoned / learned (dist > 0)
+                if not entry or entry[0] > 0:
+                    logger.info("LINK UP %s on %s — adding connected route", subnet, dev_name)
+                    # Explicitly instruct the kernel to associate the subnet
+                    # with the hardware interface directly
+                    try:
+                        subprocess.call(
+                            ["ip", "route", "replace", subnet, "dev", dev_name],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception:
+                        pass
+                    routing_table[subnet] = [0, "0.0.0.0"]
+                    poison_hold.pop(subnet, None)
+                    link_miss_count.pop(subnet, None)
+                    changed_links = True
+
+            if changed_links:
+                stable_cycles = 0
+                converged_announced = False
+
+        if changed_links:
+            print_routing_table("After physical link status changed")
+            trigger_update()
+
+        # ---- 2. Check for neighbor timeouts ----
         with table_lock:
             for neighbor in NEIGHBORS:
                 last = neighbor_last_seen.get(neighbor)
@@ -665,9 +839,14 @@ def listen_for_updates() -> None:
     Steps per packet:
       1. Decode JSON
       2. Validate version and structure
-      3. Validate router_id vs sender IP (log mismatches)
-      4. Record the neighbor's liveness timestamp
-      5. Delegate to update_logic()
+      3. **Adjacency check**: verify sender IP is on a directly-connected
+         subnet.  This is CRITICAL — Docker bridge networking can deliver
+         packets across networks via gateway routing (e.g. after a link
+         detach), causing the sender IP to be unreachable as a next-hop.
+         Accepting such packets would install kernel routes that fail.
+      4. Validate router_id vs sender IP (log mismatches)
+      5. Record the neighbor's liveness timestamp
+      6. Delegate to update_logic()
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -692,7 +871,9 @@ def listen_for_updates() -> None:
             router_id = packet.get("router_id")
             routes = packet.get("routes")
 
-            if version != DV_VERSION:
+            # Version check — accept both integer (1) and float (1.0)
+            # to handle cross-implementation compatibility.
+            if version is None or int(version) != DV_VERSION:
                 logger.warning(
                     "RECV    version mismatch from %s (got %s, expected %s)",
                     sender_ip, version, DV_VERSION,
@@ -701,6 +882,20 @@ def listen_for_updates() -> None:
 
             if not isinstance(routes, list):
                 logger.warning("RECV    invalid 'routes' field from %s", sender_ip)
+                continue
+
+            # ---- ADJACENCY CHECK (critical for correctness) ----
+            # Verify the sender's IP is on one of our directly-connected
+            # subnets.  If not, this packet arrived via Docker gateway
+            # cross-network routing — the sender is NOT a true neighbor
+            # and using their IP as next_hop would create broken kernel
+            # routes.  Drop the packet silently.
+            if not is_on_my_subnet(sender_ip):
+                logger.warning(
+                    "RECV    DROPPED packet from %s — not on any connected subnet "
+                    "(likely Docker cross-network gateway leak)",
+                    sender_ip,
+                )
                 continue
 
             # ---- router_id validation ----
@@ -756,6 +951,7 @@ def main() -> None:
     logger.info("  Neighbor timeout: %ds", NEIGHBOR_TIMEOUT)
     logger.info("  Poison hold     : %d cycles", POISON_HOLD_CYCLES)
     logger.info("  Converge after  : %d stable cycles", CONVERGE_CYCLES)
+    logger.info("  Link-down thresh: %d consecutive misses", LINK_DOWN_THRESHOLD)
     logger.info("═" * 60)
 
     # Step 0 — create shared send socket (reused by broadcast + trigger)
